@@ -1,0 +1,37 @@
+#version: "3.8"
+
+networks:
+  mpnet:
+
+services:
+  sub:
+    build:
+      context: .             # repo root where your Dockerfile is
+      dockerfile: Dockerfile
+    command:
+      - -server
+      - -subscribe
+      - -addr=0.0.0.0
+      - -port1=8080
+      - -port2=8081
+      - -namespace=multipath
+      - -trackname=video
+    cap_add: [NET_ADMIN]
+    networks: [mpnet]
+    restart: unless-stopped
+
+  pub:
+    build:
+      context: .             # same image, built from local Dockerfile
+      dockerfile: Dockerfile
+    command:
+      - -publish
+      - -addr=sub            # resolves automatically via Docker DNS
+      - -port1=8080
+      - -port2=8081
+      - -namespace=multipath
+      - -trackname=video
+    cap_add: [NET_ADMIN]
+    networks: [mpnet]
+    depends_on: [sub]
+    restart: unless-stopped
