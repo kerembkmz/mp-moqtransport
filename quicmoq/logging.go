@@ -1,3 +1,4 @@
+// #file: logging.go
 package quicmoq
 
 import (
@@ -6,12 +7,16 @@ import (
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/quic-go/quic-go/logging"
 )
 
-// LogLevel defines logging verbosity
+//
+// ====== Config ======
+//
+
 type LogLevel int
 
 const (
@@ -23,7 +28,29 @@ const (
 	LogLevelTrace
 )
 
-// AckEvent represents a packet acknowledgment event
+type WindowMode int
+
+const (
+	ByTime WindowMode = iota
+	ByPackets
+)
+
+// default rolling window used when WindowMode==ByTime
+const defaultWindow = 10 * time.Second
+
+type LoggerConfig struct {
+	LogLevel          LogLevel
+	MaxEventsPerType  int
+	EnableTerminalLog bool
+	Window            time.Duration // used when ByTime
+	WindowMode        WindowMode    // ByTime or ByPackets
+	WindowPackets     int           // used when ByPackets, e.g., 200
+}
+
+//
+// ====== Event types (minimal kept) ======
+//
+
 type AckEvent struct {
 	Timestamp       time.Time
 	PacketNumber    logging.PacketNumber
@@ -32,7 +59,6 @@ type AckEvent struct {
 	AckRanges       []logging.AckRange
 }
 
-// LossEvent represents a packet loss event
 type LossEvent struct {
 	Timestamp       time.Time
 	PacketNumber    logging.PacketNumber
@@ -40,13 +66,6 @@ type LossEvent struct {
 	Reason          logging.PacketLossReason
 }
 
-// CongestionEvent represents congestion control state changes
-type CongestionEvent struct {
-	Timestamp time.Time
-	State     logging.CongestionState
-}
-
-// ConnectionEvent represents connection lifecycle events
 type ConnectionEvent struct {
 	Timestamp time.Time
 	EventType string
@@ -55,76 +74,131 @@ type ConnectionEvent struct {
 	Error     error
 }
 
-// MOQObjectEvent represents MoQ object events
 type MOQObjectEvent struct {
-	Timestamp     time.Time
-	GroupID       uint64
-	SubGroupID    uint64
-	ObjectID      uint64
-	Size          int
-	Direction     string // "sent" or "received"
-	TransportType string // "datagram" or "stream"
-	TrackName     string
-	Namespace     []string
+	Timestamp  time.Time
+	GroupID    uint64
+	SubGroupID uint64
+	ObjectID   uint64
+	Size       int
+	Direction  string // "sent" | "received"
+	TrackName  string
+	Namespace  []string
 }
 
-// QuicLogger is the main logging structure for MoQ transport
+//
+// ====== Rolling sample buffers ======
+//
+
+type stampCount struct {
+	t time.Time
+	n int64
+}
+
+type byteSample struct {
+	t time.Time
+	b int64
+}
+
+type pktState uint8
+
+const (
+	psUnknown pktState = iota
+	psAcked
+	psLost
+)
+
+type pktSample struct {
+	t    time.Time
+	num  logging.PacketNumber
+	size int64
+	st   pktState
+}
+
+//
+// ====== Main logger ======
+//
+
 type QuicLogger struct {
+	// identity
 	sessionID   string
 	perspective logging.Perspective
-	startTime   time.Time
-	logLevel    LogLevel
 
-	// Event storage
+	// settings
+	logLevel   LogLevel
+	window     time.Duration
+	windowMode WindowMode
+	winPkts    int
+
+	// snapshots and events (optional)
 	ackEvents        []AckEvent
 	lossEvents       []LossEvent
-	congestionEvents []CongestionEvent
 	connectionEvents []ConnectionEvent
 	moqObjectEvents  []MOQObjectEvent
 
-	// Metrics
-	totalPacketsSent      uint64
-	totalPacketsReceived  uint64
-	totalPacketsAcked     uint64
-	totalPacketsLost      uint64
-	totalBytesTransferred uint64
+	// rolling samples (protected by mtx)
+	mtx sync.RWMutex
 
-	// Latest RTT (latency)
+	// ByTime accounting
+	sentPkts  []stampCount // count of packets sent
+	rcvdPkts  []stampCount // count of packets received
+	ackedPkts []stampCount // count of packets acked
+	lostPkts  []stampCount // count of packets lost
+	sentBytes []byteSample // bytes sent
+	rcvdBytes []byteSample // bytes received
+
+	// ByPackets accounting (cohort ring of the last N sent packets)
+	ring      []pktSample
+	ringHead  int
+	ringCount int
+	byNum     map[logging.PacketNumber]int // packet number -> index in ring
+
+	// latest RTT from quic-go
 	latestRTT time.Duration
 
-	// Thread safety
-	mutex sync.RWMutex
+	// NEW: transport-layer live metrics (from UpdatedMetrics)
+	cwndBytes       int64
+	bytesInFlight   int64
+	packetsInFlight int64
+
+	// smoothed telemetry (EWMA) to stabilize readings
+	smoothedLoss float64
+	smoothedRTT  float64 // nanoseconds
+
+	start time.Time
 }
 
-// LoggerConfig holds configuration for the logger
-type LoggerConfig struct {
-	LogLevel          LogLevel
-	MaxEventsPerType  int
-	EnableTerminalLog bool
-	EnableMetrics     bool
-}
-
-// NewQuicLogger creates a new QUIC logger for MoQ transport
-func NewQuicLogger(sessionID string, perspective logging.Perspective, config *LoggerConfig) *QuicLogger {
-	if config == nil {
-		config = &LoggerConfig{
+func NewQuicLogger(sessionID string, perspective logging.Perspective, cfg *LoggerConfig) *QuicLogger {
+	if cfg == nil {
+		cfg = &LoggerConfig{
 			LogLevel:          LogLevelInfo,
 			MaxEventsPerType:  1000,
 			EnableTerminalLog: true,
-			EnableMetrics:     true,
+			Window:            defaultWindow,
+			WindowMode:        ByPackets,
+			WindowPackets:     100,
 		}
 	}
-
+	w := cfg.Window
+	if w <= 0 {
+		w = defaultWindow
+	}
+	if cfg.WindowPackets <= 0 {
+		cfg.WindowPackets = 100
+	}
 	return &QuicLogger{
 		sessionID:        sessionID,
 		perspective:      perspective,
-		startTime:        time.Now(),
-		logLevel:         config.LogLevel,
-		ackEvents:        make([]AckEvent, 0, config.MaxEventsPerType),
-		lossEvents:       make([]LossEvent, 0, config.MaxEventsPerType),
-		congestionEvents: make([]CongestionEvent, 0, config.MaxEventsPerType),
-		connectionEvents: make([]ConnectionEvent, 0, config.MaxEventsPerType),
-		moqObjectEvents:  make([]MOQObjectEvent, 0, config.MaxEventsPerType),
+		logLevel:         cfg.LogLevel,
+		window:           w,
+		windowMode:       cfg.WindowMode,
+		winPkts:          cfg.WindowPackets,
+		start:            time.Now(),
+		smoothedLoss:     0,
+		smoothedRTT:      0,
+		ackEvents:        make([]AckEvent, 0, cfg.MaxEventsPerType),
+		lossEvents:       make([]LossEvent, 0, cfg.MaxEventsPerType),
+		connectionEvents: make([]ConnectionEvent, 0, cfg.MaxEventsPerType),
+		moqObjectEvents:  make([]MOQObjectEvent, 0, cfg.MaxEventsPerType),
 	}
 }
 
@@ -132,171 +206,578 @@ func NewQuicLoggerWithDefaults(sessionID string) *QuicLogger {
 	return NewQuicLogger(sessionID, logging.PerspectiveClient, nil)
 }
 
-// CreateConnectionTracer returns a QUIC connection tracer that feeds into this logger
-func (ql *QuicLogger) CreateConnectionTracer() func(context.Context, logging.Perspective, logging.ConnectionID) *logging.ConnectionTracer {
-	return func(ctx context.Context, p logging.Perspective, connID logging.ConnectionID) *logging.ConnectionTracer {
-		ql.perspective = p
-		return &logging.ConnectionTracer{
-			StartedConnection: func(local, remote net.Addr, srcConnID, destConnID logging.ConnectionID) {
-				ql.recordConnectionEvent("started", local, remote, nil)
-				ql.logToTerminal(LogLevelInfo, "Connection started: %v -> %v", local, remote)
-			},
-			ClosedConnection: func(err error) {
-				ql.recordConnectionEvent("closed", nil, nil, err)
-				ql.logToTerminal(LogLevelInfo, "Connection closed: %v", err)
-			},
-			SentLongHeaderPacket: func(hdr *logging.ExtendedHeader, size logging.ByteCount, ecn logging.ECN, ack *logging.AckFrame, frames []logging.Frame) {
-				ql.recordPacketSent(size)
-				if ack != nil {
-					ql.recordAckSent(ack)
-				}
-			},
-			SentShortHeaderPacket: func(hdr *logging.ShortHeader, size logging.ByteCount, ecn logging.ECN, ack *logging.AckFrame, frames []logging.Frame) {
-				ql.recordPacketSent(size)
-				if ack != nil {
-					ql.recordAckSent(ack)
-				}
-			},
-			ReceivedLongHeaderPacket: func(hdr *logging.ExtendedHeader, size logging.ByteCount, ecn logging.ECN, frames []logging.Frame) {
-				ql.recordPacketReceived(size)
-				for _, frame := range frames {
-					if ackFrame, ok := frame.(*logging.AckFrame); ok {
-						ql.recordAckReceived(ackFrame)
-					}
-				}
-			},
-			ReceivedShortHeaderPacket: func(hdr *logging.ShortHeader, size logging.ByteCount, ecn logging.ECN, frames []logging.Frame) {
-				ql.recordPacketReceived(size)
-				for _, frame := range frames {
-					if ackFrame, ok := frame.(*logging.AckFrame); ok {
-						ql.recordAckReceived(ackFrame)
-					}
-				}
-			},
-			AcknowledgedPacket: func(level logging.EncryptionLevel, number logging.PacketNumber) {
-				ql.recordPacketAcked(level, number)
-				ql.logToTerminal(LogLevelDebug, "Packet acknowledged: level=%v, number=%d", level, number)
-			},
-			LostPacket: func(level logging.EncryptionLevel, number logging.PacketNumber, reason logging.PacketLossReason) {
-				ql.recordPacketLost(level, number, reason)
-				ql.logToTerminal(LogLevelWarn, "Packet lost: level=%v, number=%d, reason=%v", level, number, reason)
-			},
-			UpdatedCongestionState: func(state logging.CongestionState) {
-				ql.recordCongestionStateChange(state)
-				ql.logToTerminal(LogLevelDebug, "Congestion state updated: %v", state)
-			},
-			UpdatedMetrics: func(rttStats *logging.RTTStats, cwnd, bytesInFlight logging.ByteCount, packetsInFlight int) {
-				ql.mutex.Lock()
-				ql.latestRTT = rttStats.SmoothedRTT()
-				ql.mutex.Unlock()
-				ql.logToTerminal(LogLevelDebug, "Updated RTT: %v", rttStats.SmoothedRTT())
-			},
-			Close: func() {
-				ql.logToTerminal(LogLevelInfo, "Connection tracer closed")
-			},
+//
+// ====== Root (manages per-connection child loggers) ======
+//
+
+type RootQuicLogger struct {
+	sessionID string
+	config    *LoggerConfig
+	children  map[string]*QuicLogger
+	// map from observed connection id string or remote addr to child key
+	connToKey map[string]string
+	// atomic counter to create unique keys
+	nextID uint64
+	mutex  sync.RWMutex
+}
+
+func NewRootQuicLogger(sessionID string, cfg *LoggerConfig) *RootQuicLogger {
+	if cfg == nil {
+		cfg = &LoggerConfig{
+			LogLevel:          LogLevelInfo,
+			MaxEventsPerType:  1000,
+			EnableTerminalLog: true,
+			Window:            defaultWindow,
+			WindowMode:        ByTime,
+			WindowPackets:     200,
 		}
 	}
-}
-
-// Record functions for different event types
-func (ql *QuicLogger) recordConnectionEvent(eventType string, local, remote net.Addr, err error) {
-	ql.mutex.Lock()
-	defer ql.mutex.Unlock()
-
-	event := ConnectionEvent{
-		Timestamp: time.Now(),
-		EventType: eventType,
-		Local:     local,
-		Remote:    remote,
-		Error:     err,
+	return &RootQuicLogger{
+		sessionID: sessionID,
+		config:    cfg,
+		children:  make(map[string]*QuicLogger),
+		connToKey: make(map[string]string),
+		nextID:    0,
 	}
-	ql.connectionEvents = append(ql.connectionEvents, event)
 }
 
-func (ql *QuicLogger) recordPacketSent(size logging.ByteCount) {
-	ql.mutex.Lock()
-	defer ql.mutex.Unlock()
-	ql.totalPacketsSent++
-	ql.totalBytesTransferred += uint64(size)
-}
-
-func (ql *QuicLogger) recordPacketReceived(size logging.ByteCount) {
-	ql.mutex.Lock()
-	defer ql.mutex.Unlock()
-	ql.totalPacketsReceived++
-	ql.totalBytesTransferred += uint64(size)
-}
-
-func (ql *QuicLogger) recordAckSent(ack *logging.AckFrame) {
-	ql.mutex.Lock()
-	defer ql.mutex.Unlock()
-
-	event := AckEvent{
-		Timestamp: time.Now(),
-		DelayTime: ack.DelayTime,
-		AckRanges: ack.AckRanges,
+func (rl *RootQuicLogger) GetChild(connID string, p logging.Perspective) *QuicLogger {
+	rl.mutex.RLock()
+	if c, ok := rl.children[connID]; ok {
+		rl.mutex.RUnlock()
+		return c
 	}
-	ql.ackEvents = append(ql.ackEvents, event)
-	ql.logToTerminal(LogLevelTrace, "ACK sent: DelayTime=%v, Ranges=%v", ack.DelayTime, ack.AckRanges)
-}
+	rl.mutex.RUnlock()
 
-func (ql *QuicLogger) recordAckReceived(ack *logging.AckFrame) {
-	ql.mutex.Lock()
-	defer ql.mutex.Unlock()
-
-	event := AckEvent{
-		Timestamp: time.Now(),
-		DelayTime: ack.DelayTime,
-		AckRanges: ack.AckRanges,
+	rl.mutex.Lock()
+	defer rl.mutex.Unlock()
+	if c, ok := rl.children[connID]; ok {
+		return c
 	}
-	ql.ackEvents = append(ql.ackEvents, event)
-	ql.logToTerminal(LogLevelTrace, "ACK received: DelayTime=%v, Ranges=%v", ack.DelayTime, ack.AckRanges)
+	c := NewQuicLogger(fmt.Sprintf("%s/%s", rl.sessionID, connID), p, rl.config)
+	rl.children[connID] = c
+	return c
 }
 
-func (ql *QuicLogger) recordPacketAcked(level logging.EncryptionLevel, number logging.PacketNumber) {
-	ql.mutex.Lock()
-	defer ql.mutex.Unlock()
+func (rl *RootQuicLogger) CreateConnectionTracer() func(context.Context, logging.Perspective, logging.ConnectionID) *logging.ConnectionTracer {
+	return func(ctx context.Context, p logging.Perspective, cid logging.ConnectionID) *logging.ConnectionTracer {
+		// create a temporary unique child key; register the real mapping in StartedConnection
+		key := fmt.Sprintf("auto-%d", atomic.AddUint64(&rl.nextID, 1))
+		child := NewQuicLogger(fmt.Sprintf("%s/%s", rl.sessionID, key), p, rl.config)
 
-	event := AckEvent{
-		Timestamp:       time.Now(),
-		PacketNumber:    number,
-		EncryptionLevel: level,
+		rl.mutex.Lock()
+		rl.children[key] = child
+		rl.mutex.Unlock()
+
+		t := child.CreateConnectionTracer()(ctx, p, cid)
+
+		wrapper := &logging.ConnectionTracer{
+			StartedConnection: func(local, remote net.Addr, srcConnID, destConnID logging.ConnectionID) {
+				connStr := srcConnID.String()
+				if connStr == "" {
+					connStr = destConnID.String()
+				}
+
+				rl.mutex.Lock()
+				if connStr != "" {
+					rl.connToKey[connStr] = key
+					rl.children[connStr] = child
+				}
+				if remote != nil {
+					ra := remote.String()
+					rl.connToKey[ra] = key
+					rl.children[ra] = child
+				}
+				rl.mutex.Unlock()
+
+				if t != nil && t.StartedConnection != nil {
+					t.StartedConnection(local, remote, srcConnID, destConnID)
+				}
+			},
+			ClosedConnection: func(err error) {
+				if t != nil && t.ClosedConnection != nil {
+					t.ClosedConnection(err)
+				}
+			},
+			SentLongHeaderPacket: func(hdr *logging.ExtendedHeader, size logging.ByteCount, ecn logging.ECN, ack *logging.AckFrame, frames []logging.Frame) {
+				if t != nil && t.SentLongHeaderPacket != nil {
+					t.SentLongHeaderPacket(hdr, size, ecn, ack, frames)
+				}
+				child.onSent(hdr.PacketNumber, size)
+			},
+			SentShortHeaderPacket: func(hdr *logging.ShortHeader, size logging.ByteCount, ecn logging.ECN, ack *logging.AckFrame, frames []logging.Frame) {
+				if t != nil && t.SentShortHeaderPacket != nil {
+					t.SentShortHeaderPacket(hdr, size, ecn, ack, frames)
+				}
+				child.onSent(hdr.PacketNumber, size)
+			},
+			ReceivedLongHeaderPacket: func(hdr *logging.ExtendedHeader, size logging.ByteCount, ecn logging.ECN, frames []logging.Frame) {
+				if t != nil && t.ReceivedLongHeaderPacket != nil {
+					t.ReceivedLongHeaderPacket(hdr, size, ecn, frames)
+				}
+				child.onRcvd(size)
+			},
+			ReceivedShortHeaderPacket: func(hdr *logging.ShortHeader, size logging.ByteCount, ecn logging.ECN, frames []logging.Frame) {
+				if t != nil && t.ReceivedShortHeaderPacket != nil {
+					t.ReceivedShortHeaderPacket(hdr, size, ecn, frames)
+				}
+				child.onRcvd(size)
+			},
+			AcknowledgedPacket: func(level logging.EncryptionLevel, number logging.PacketNumber) {
+				if t != nil && t.AcknowledgedPacket != nil {
+					t.AcknowledgedPacket(level, number)
+				}
+				child.onAck(number)
+			},
+			LostPacket: func(level logging.EncryptionLevel, number logging.PacketNumber, reason logging.PacketLossReason) {
+				if t != nil && t.LostPacket != nil {
+					t.LostPacket(level, number, reason)
+				}
+				child.onLoss(number)
+			},
+			UpdatedCongestionState: func(state logging.CongestionState) {
+				if t != nil && t.UpdatedCongestionState != nil {
+					t.UpdatedCongestionState(state)
+				}
+			},
+			UpdatedMetrics: func(rttStats *logging.RTTStats, cwnd, bytesInFlight logging.ByteCount, packetsInFlight int) {
+				if t != nil && t.UpdatedMetrics != nil {
+					t.UpdatedMetrics(rttStats, cwnd, bytesInFlight, packetsInFlight)
+				}
+				child.mtx.Lock()
+				child.latestRTT = rttStats.SmoothedRTT()
+				// EWMA for RTT: convert to float64 nanoseconds
+				alpha := 0.3
+				rttNs := float64(child.latestRTT.Nanoseconds())
+				if child.smoothedRTT == 0 {
+					child.smoothedRTT = rttNs
+				} else {
+					child.smoothedRTT = alpha*rttNs + (1-alpha)*child.smoothedRTT
+				}
+				// NEW: store transport metrics
+				child.cwndBytes = int64(cwnd)
+				child.bytesInFlight = int64(bytesInFlight)
+				child.packetsInFlight = int64(packetsInFlight)
+
+				// prune time-based buffers to avoid growth
+				child.prune(time.Now())
+				child.mtx.Unlock()
+
+				child.logToTerminal(LogLevelDebug, "rtt=%v cwnd=%d bif=%d pif=%d", child.latestRTT, cwnd, bytesInFlight, packetsInFlight)
+			},
+			Close: func() {
+				if t != nil && t.Close != nil {
+					t.Close()
+				}
+			},
+		}
+
+		return wrapper
 	}
-	ql.ackEvents = append(ql.ackEvents, event)
-	ql.totalPacketsAcked++
 }
 
-func (ql *QuicLogger) recordPacketLost(level logging.EncryptionLevel, number logging.PacketNumber, reason logging.PacketLossReason) {
-	ql.mutex.Lock()
-	defer ql.mutex.Unlock()
-
-	event := LossEvent{
-		Timestamp:       time.Now(),
-		PacketNumber:    number,
-		EncryptionLevel: level,
-		Reason:          reason,
+// GetRegisteredChild returns a child logger if it was registered for the given key (connID or remote addr)
+func (rl *RootQuicLogger) GetRegisteredChild(key string) *QuicLogger {
+	rl.mutex.RLock()
+	defer rl.mutex.RUnlock()
+	if c, ok := rl.children[key]; ok {
+		return c
 	}
-	ql.lossEvents = append(ql.lossEvents, event)
-	ql.totalPacketsLost++
-}
-
-func (ql *QuicLogger) recordCongestionStateChange(state logging.CongestionState) {
-	ql.mutex.Lock()
-	defer ql.mutex.Unlock()
-
-	event := CongestionEvent{
-		Timestamp: time.Now(),
-		State:     state,
+	if mapped, ok := rl.connToKey[key]; ok {
+		if c, ok2 := rl.children[mapped]; ok2 {
+			return c
+		}
 	}
-	ql.congestionEvents = append(ql.congestionEvents, event)
+	return nil
 }
 
-// RecordMOQObject records MoQ-specific object events
-func (ql *QuicLogger) RecordMOQObject(groupID, subGroupID, objectID uint64, size int, direction, trackName string, namespace []string) {
-	ql.mutex.Lock()
-	defer ql.mutex.Unlock()
+//
+// ====== Internal helpers ======
+//
 
-	event := MOQObjectEvent{
+func trimStampsN(s []stampCount, n int) []stampCount {
+	if n <= 0 {
+		return s[:0]
+	}
+	if len(s) <= n {
+		return s
+	}
+	return s[len(s)-n:]
+}
+func trimBytesN(s []byteSample, n int) []byteSample {
+	if n <= 0 {
+		return s[:0]
+	}
+	if len(s) <= n {
+		return s
+	}
+	return s[len(s)-n:]
+}
+
+func (q *QuicLogger) prune(now time.Time) {
+	// Always prune time-based slices so they don't grow without bound.
+	cut := now.Add(-q.window)
+	pruneStamps := func(s []stampCount) []stampCount {
+		i := 0
+		for i < len(s) && s[i].t.Before(cut) {
+			i++
+		}
+		return s[i:]
+	}
+	pruneBytes := func(s []byteSample) []byteSample {
+		i := 0
+		for i < len(s) && s[i].t.Before(cut) {
+			i++
+		}
+		return s[i:]
+	}
+	q.sentPkts = pruneStamps(q.sentPkts)
+	q.rcvdPkts = pruneStamps(q.rcvdPkts)
+	q.ackedPkts = pruneStamps(q.ackedPkts)
+	q.lostPkts = pruneStamps(q.lostPkts)
+	q.sentBytes = pruneBytes(q.sentBytes)
+	q.rcvdBytes = pruneBytes(q.rcvdBytes)
+
+	// In packet-window mode, also cap rcvdBytes to ~2x window packets to bound memory.
+	if q.windowMode == ByPackets && len(q.rcvdBytes) > 2*q.winPkts {
+		q.rcvdBytes = trimBytesN(q.rcvdBytes, 2*q.winPkts)
+	}
+}
+
+// ByTime adds
+func (q *QuicLogger) addSent(size logging.ByteCount) {
+	now := time.Now()
+	q.sentPkts = append(q.sentPkts, stampCount{t: now, n: 1})
+	q.sentBytes = append(q.sentBytes, byteSample{t: now, b: int64(size)})
+	q.prune(now)
+}
+func (q *QuicLogger) addRcvd(size logging.ByteCount) {
+	now := time.Now()
+	q.rcvdPkts = append(q.rcvdPkts, stampCount{t: now, n: 1})
+	q.rcvdBytes = append(q.rcvdBytes, byteSample{t: now, b: int64(size)})
+	q.prune(now)
+}
+func (q *QuicLogger) addAck(number logging.PacketNumber, level logging.EncryptionLevel) {
+	now := time.Now()
+	q.ackedPkts = append(q.ackedPkts, stampCount{t: now, n: 1})
+	q.prune(now)
+	q.logToTerminal(LogLevelTrace, "ACK pkt=%d lvl=%v", number, level)
+}
+func (q *QuicLogger) addLoss(number logging.PacketNumber, level logging.EncryptionLevel, reason logging.PacketLossReason) {
+	now := time.Now()
+	q.lostPkts = append(q.lostPkts, stampCount{t: now, n: 1})
+	q.prune(now)
+	q.logToTerminal(LogLevelWarn, "LOSS pkt=%d lvl=%v reason=%v", number, level, reason)
+}
+
+// ByPackets cohort ops
+func (q *QuicLogger) ringEnsure() {
+	if q.ring == nil {
+		q.ring = make([]pktSample, q.winPkts)
+		q.byNum = make(map[logging.PacketNumber]int, q.winPkts)
+	}
+}
+
+func (q *QuicLogger) onSent(number logging.PacketNumber, size logging.ByteCount) {
+	q.mtx.Lock()
+	defer q.mtx.Unlock()
+
+	if q.windowMode == ByPackets {
+		q.ringEnsure()
+		idx := q.ringHead
+		// evict old
+		if q.ringCount == q.winPkts {
+			old := q.ring[idx]
+			delete(q.byNum, old.num)
+		} else {
+			q.ringCount++
+		}
+		q.ring[idx] = pktSample{t: time.Now(), num: number, size: int64(size), st: psUnknown}
+		q.byNum[number] = idx
+		q.ringHead = (q.ringHead + 1) % q.winPkts
+		// also keep a small receive buffer bounded
+		q.prune(time.Now())
+		return
+	}
+
+	// ByTime
+	q.addSent(size)
+}
+
+func (q *QuicLogger) onRcvd(size logging.ByteCount) {
+	q.mtx.Lock()
+	defer q.mtx.Unlock()
+
+	// Track RX bytes for both modes to compute RX rate.
+	now := time.Now()
+	q.rcvdPkts = append(q.rcvdPkts, stampCount{t: now, n: 1})
+	q.rcvdBytes = append(q.rcvdBytes, byteSample{t: now, b: int64(size)})
+	q.prune(now)
+}
+
+func (q *QuicLogger) onAck(number logging.PacketNumber) {
+	q.mtx.Lock()
+	defer q.mtx.Unlock()
+
+	if q.windowMode == ByPackets {
+		if idx, ok := q.byNum[number]; ok {
+			q.ring[idx].st = psAcked // overrides prior psLost
+		}
+		return
+	}
+
+	// ByTime
+	q.ackedPkts = append(q.ackedPkts, stampCount{t: time.Now(), n: 1})
+	q.prune(time.Now())
+}
+
+func (q *QuicLogger) onLoss(number logging.PacketNumber) {
+	q.mtx.Lock()
+	defer q.mtx.Unlock()
+
+	if q.windowMode == ByPackets {
+		if idx, ok := q.byNum[number]; ok && q.ring[idx].st == psUnknown {
+			q.ring[idx].st = psLost
+		}
+		return
+	}
+
+	// ByTime
+	q.lostPkts = append(q.lostPkts, stampCount{t: time.Now(), n: 1})
+	q.prune(time.Now())
+}
+
+func (q *QuicLogger) logToTerminal(level LogLevel, format string, args ...interface{}) {
+	if level <= q.logLevel {
+		outArgs := make([]any, 0, 1+len(args))
+		outArgs = append(outArgs, q.sessionID)
+		outArgs = append(outArgs, args...)
+		log.Printf("[%s] "+format, outArgs...)
+	}
+}
+
+//
+// ====== Public metrics ======
+//
+
+type RollingMetrics struct {
+	Window       time.Duration
+	PktWindow    int // when ByPackets, the cohort size
+	SentPackets  int64
+	AckedPackets int64
+	LostPackets  int64
+	RecvPackets  int64
+	SentBytes    int64
+	RecvBytes    int64
+	LossPercent  float64 // transport loss = lost / (acked + lost), EWMA-smoothed
+	SendRateBps  float64
+	RecvRateBps  float64
+	SmoothedRTT  time.Duration
+	AsOf         time.Time
+	// NEW: transport-layer instantaneous metrics
+	CwndBytes       int64
+	BytesInFlight   int64
+	PacketsInFlight int64
+}
+
+func sumStamps(s []stampCount) int64 {
+	var n int64
+	for _, x := range s {
+		n += x.n
+	}
+	return n
+}
+func sumBytes(s []byteSample) int64 {
+	var n int64
+	for _, x := range s {
+		n += x.b
+	}
+	return n
+}
+
+func windowSpanStamps(s []stampCount) time.Duration {
+	if len(s) < 2 {
+		return 0
+	}
+	return s[len(s)-1].t.Sub(s[0].t)
+}
+func windowSpanBytes(s []byteSample) time.Duration {
+	if len(s) < 2 {
+		return 0
+	}
+	return s[len(s)-1].t.Sub(s[0].t)
+}
+
+func (q *QuicLogger) packetWindowMetrics() (sent, acked, lost int64, bytes int64, span time.Duration) {
+	if q.ringCount == 0 {
+		return
+	}
+	// ringHead points to next insertion position.
+	// iterate last ringCount samples in chronological order.
+	firstIdx := -1
+	lastIdx := -1
+	for i := 0; i < q.ringCount; i++ {
+		idx := (q.ringHead - q.ringCount + i + q.winPkts) % q.winPkts
+		s := q.ring[idx]
+		// slots may be zeroed before fully populated
+		if s.num == 0 && s.size == 0 && s.t.IsZero() {
+			continue
+		}
+		if firstIdx == -1 {
+			firstIdx = idx
+		}
+		lastIdx = idx
+		sent++
+		bytes += s.size
+		switch s.st {
+		case psAcked:
+			acked++
+		case psLost:
+			lost++
+		}
+	}
+	if firstIdx >= 0 && lastIdx >= 0 {
+		t0 := q.ring[firstIdx].t
+		t1 := q.ring[lastIdx].t
+		if t1.After(t0) {
+			span = t1.Sub(t0)
+		} else {
+			span = time.Second
+		}
+	} else {
+		span = time.Second
+	}
+	return
+}
+
+func (q *QuicLogger) recvBytesWithin(span time.Duration) (bytes int64, packets int64) {
+	if span <= 0 {
+		return 0, 0
+	}
+	cut := time.Now().Add(-span)
+	for _, s := range q.rcvdBytes {
+		if s.t.After(cut) || s.t.Equal(cut) {
+			bytes += s.b
+		}
+	}
+	for _, s := range q.rcvdPkts {
+		if s.t.After(cut) || s.t.Equal(cut) {
+			packets += s.n
+		}
+	}
+	return
+}
+
+func (q *QuicLogger) GetRollingMetrics() RollingMetrics {
+	now := time.Now()
+
+	q.mtx.RLock()
+	defer q.mtx.RUnlock()
+
+	// RTT output
+	outRTT := q.latestRTT
+	if q.smoothedRTT > 0 {
+		outRTT = time.Duration(uint64(q.smoothedRTT))
+	}
+
+	if q.windowMode == ByPackets {
+		sentPk, ackPk, lostPk, sentBy, span := q.packetWindowMetrics()
+		if span <= 0 {
+			span = time.Second
+		}
+		// transport loss = lost / (acked + lost)
+		den := ackPk + lostPk
+		loss := 0.0
+		if den > 0 {
+			loss = float64(lostPk) * 100.0 / float64(den)
+		}
+		// EWMA to stabilize loss
+		alpha := 0.2
+		if q.smoothedLoss == 0 {
+			q.smoothedLoss = loss
+		} else {
+			q.smoothedLoss = alpha*loss + (1-alpha)*q.smoothedLoss
+		}
+
+		sendRate := float64(sentBy) * 8.0 / span.Seconds()
+		rxBytes, rxPkts := q.recvBytesWithin(span)
+		recvRate := float64(rxBytes) * 8.0 / span.Seconds()
+
+		return RollingMetrics{
+			Window:          span,
+			PktWindow:       q.winPkts,
+			SentPackets:     sentPk,
+			AckedPackets:    ackPk,
+			LostPackets:     lostPk,
+			RecvPackets:     rxPkts,
+			SentBytes:       sentBy,
+			RecvBytes:       rxBytes,
+			LossPercent:     q.smoothedLoss,
+			SendRateBps:     sendRate,
+			RecvRateBps:     recvRate,
+			SmoothedRTT:     outRTT,
+			AsOf:            now,
+			CwndBytes:       q.cwndBytes,
+			BytesInFlight:   q.bytesInFlight,
+			PacketsInFlight: q.packetsInFlight,
+		}
+	}
+
+	// ByTime mode
+	sentPk := sumStamps(q.sentPkts)
+	ackPk := sumStamps(q.ackedPkts)
+	lostPk := sumStamps(q.lostPkts)
+	rcvPk := sumStamps(q.rcvdPkts)
+	sentBy := sumBytes(q.sentBytes)
+	rcvBy := sumBytes(q.rcvdBytes)
+
+	// transport loss = lost / (acked + lost)
+	den := ackPk + lostPk
+	loss := 0.0
+	if den > 0 {
+		loss = float64(lostPk) * 100.0 / float64(den)
+	}
+
+	sendRate := float64(sentBy) * 8.0 / q.window.Seconds()
+	recvRate := float64(rcvBy) * 8.0 / q.window.Seconds()
+
+	alpha := 0.2
+	if q.smoothedLoss == 0 {
+		q.smoothedLoss = loss
+	} else {
+		q.smoothedLoss = alpha*loss + (1-alpha)*q.smoothedLoss
+	}
+
+	return RollingMetrics{
+		Window:          q.window,
+		PktWindow:       0,
+		SentPackets:     sentPk,
+		AckedPackets:    ackPk,
+		LostPackets:     lostPk,
+		RecvPackets:     rcvPk,
+		SentBytes:       sentBy,
+		RecvBytes:       rcvBy,
+		LossPercent:     q.smoothedLoss,
+		SendRateBps:     sendRate,
+		RecvRateBps:     recvRate,
+		SmoothedRTT:     outRTT,
+		AsOf:            now,
+		CwndBytes:       q.cwndBytes,
+		BytesInFlight:   q.bytesInFlight,
+		PacketsInFlight: q.packetsInFlight,
+	}
+}
+
+func (q *QuicLogger) GetRTT() time.Duration {
+	q.mtx.RLock()
+	defer q.mtx.RUnlock()
+	return q.latestRTT
+}
+
+// Optional: expose events if needed
+func (q *QuicLogger) RecordMOQObject(groupID, subGroupID, objectID uint64, size int, direction, trackName string, namespace []string) {
+	q.mtx.Lock()
+	q.moqObjectEvents = append(q.moqObjectEvents, MOQObjectEvent{
 		Timestamp:  time.Now(),
 		GroupID:    groupID,
 		SubGroupID: subGroupID,
@@ -305,197 +786,107 @@ func (ql *QuicLogger) RecordMOQObject(groupID, subGroupID, objectID uint64, size
 		Direction:  direction,
 		TrackName:  trackName,
 		Namespace:  namespace,
-	}
-	ql.moqObjectEvents = append(ql.moqObjectEvents, event)
-	// ql.logToTerminal(LogLevelInfo, "MoQ Object %s: Track=%s, Group=%d, Object=%d, Size=%d",
-	// 	direction, trackName, groupID, objectID, size)
+	})
+	q.mtx.Unlock()
 }
 
-// Getter functions for retrieving logged events
-func (ql *QuicLogger) GetAckEvents() []AckEvent {
-	ql.mutex.RLock()
-	defer ql.mutex.RUnlock()
-	result := make([]AckEvent, len(ql.ackEvents))
-	copy(result, ql.ackEvents)
-	return result
-}
+//
+// ====== Tracer wiring (per-connection) ======
+//
 
-func (ql *QuicLogger) GetLossEvents() []LossEvent {
-	ql.mutex.RLock()
-	defer ql.mutex.RUnlock()
-	result := make([]LossEvent, len(ql.lossEvents))
-	copy(result, ql.lossEvents)
-	return result
-}
+func (q *QuicLogger) CreateConnectionTracer() func(context.Context, logging.Perspective, logging.ConnectionID) *logging.ConnectionTracer {
+	return func(ctx context.Context, p logging.Perspective, _ logging.ConnectionID) *logging.ConnectionTracer {
+		q.perspective = p
 
-func (ql *QuicLogger) GetCongestionEvents() []CongestionEvent {
-	ql.mutex.RLock()
-	defer ql.mutex.RUnlock()
-	result := make([]CongestionEvent, len(ql.congestionEvents))
-	copy(result, ql.congestionEvents)
-	return result
-}
+		return &logging.ConnectionTracer{
+			StartedConnection: func(local, remote net.Addr, srcConnID, destConnID logging.ConnectionID) {
+				q.mtx.Lock()
+				q.connectionEvents = append(q.connectionEvents, ConnectionEvent{
+					Timestamp: time.Now(),
+					EventType: "started",
+					Local:     local,
+					Remote:    remote,
+				})
+				q.mtx.Unlock()
+				q.logToTerminal(LogLevelInfo, "conn started local=%v remote=%v", local, remote)
+			},
+			ClosedConnection: func(err error) {
+				q.mtx.Lock()
+				q.connectionEvents = append(q.connectionEvents, ConnectionEvent{
+					Timestamp: time.Now(),
+					EventType: "closed",
+					Error:     err,
+				})
+				q.mtx.Unlock()
+				q.logToTerminal(LogLevelInfo, "conn closed err=%v", err)
+			},
+			SentLongHeaderPacket: func(hdr *logging.ExtendedHeader, size logging.ByteCount, ecn logging.ECN, ack *logging.AckFrame, frames []logging.Frame) {
+				q.onSent(hdr.PacketNumber, size)
+			},
+			SentShortHeaderPacket: func(hdr *logging.ShortHeader, size logging.ByteCount, ecn logging.ECN, ack *logging.AckFrame, frames []logging.Frame) {
+				q.onSent(hdr.PacketNumber, size)
+			},
+			ReceivedLongHeaderPacket: func(hdr *logging.ExtendedHeader, size logging.ByteCount, ecn logging.ECN, frames []logging.Frame) {
+				q.onRcvd(size)
+			},
+			ReceivedShortHeaderPacket: func(hdr *logging.ShortHeader, size logging.ByteCount, ecn logging.ECN, frames []logging.Frame) {
+				q.onRcvd(size)
+			},
+			AcknowledgedPacket: func(level logging.EncryptionLevel, number logging.PacketNumber) {
+				q.onAck(number)
+			},
+			LostPacket: func(level logging.EncryptionLevel, number logging.PacketNumber, reason logging.PacketLossReason) {
+				q.onLoss(number)
+			},
+			UpdatedMetrics: func(rttStats *logging.RTTStats, cwnd, bytesInFlight logging.ByteCount, packetsInFlight int) {
+				q.mtx.Lock()
+				q.latestRTT = rttStats.SmoothedRTT()
+				alpha := 0.2
+				rttNs := float64(q.latestRTT.Nanoseconds())
+				if q.smoothedRTT == 0 {
+					q.smoothedRTT = rttNs
+				} else {
+					q.smoothedRTT = alpha*rttNs + (1-alpha)*q.smoothedRTT
+				}
+				// NEW:
+				q.cwndBytes = int64(cwnd)
+				q.bytesInFlight = int64(bytesInFlight)
+				q.packetsInFlight = int64(packetsInFlight)
 
-func (ql *QuicLogger) GetConnectionEvents() []ConnectionEvent {
-	ql.mutex.RLock()
-	defer ql.mutex.RUnlock()
-	result := make([]ConnectionEvent, len(ql.connectionEvents))
-	copy(result, ql.connectionEvents)
-	return result
-}
-
-func (ql *QuicLogger) GetMOQObjectEvents() []MOQObjectEvent {
-	ql.mutex.RLock()
-	defer ql.mutex.RUnlock()
-	result := make([]MOQObjectEvent, len(ql.moqObjectEvents))
-	copy(result, ql.moqObjectEvents)
-	return result
-}
-
-// GetMetrics returns basic connection metrics
-func (ql *QuicLogger) GetMetrics() map[string]interface{} {
-	ql.mutex.RLock()
-	defer ql.mutex.RUnlock()
-
-	duration := time.Since(ql.startTime)
-	lossRate := float64(0)
-	if ql.totalPacketsSent > 0 {
-		lossRate = float64(ql.totalPacketsLost) / float64(ql.totalPacketsSent) * 100
-	}
-
-	return map[string]interface{}{
-		"session_id":              ql.sessionID,
-		"perspective":             ql.perspective.String(),
-		"duration_seconds":        duration.Seconds(),
-		"total_packets_sent":      ql.totalPacketsSent,
-		"total_packets_received":  ql.totalPacketsReceived,
-		"total_packets_acked":     ql.totalPacketsAcked,
-		"total_packets_lost":      ql.totalPacketsLost,
-		"loss_rate_percent":       lossRate,
-		"total_bytes":             ql.totalBytesTransferred,
-		"ack_events_count":        len(ql.ackEvents),
-		"loss_events_count":       len(ql.lossEvents),
-		"congestion_events_count": len(ql.congestionEvents),
-		"moq_objects_count":       len(ql.moqObjectEvents),
-	}
-}
-
-// SetLogLevel changes the current log level
-func (ql *QuicLogger) SetLogLevel(level LogLevel) {
-	ql.mutex.Lock()
-	defer ql.mutex.Unlock()
-	ql.logLevel = level
-}
-
-// LogSummary prints a summary of the connection to the terminal
-func (ql *QuicLogger) LogSummary() {
-	metrics := ql.GetMetrics()
-
-	ql.mutex.RLock()
-	rtt := ql.latestRTT
-	ql.mutex.RUnlock()
-
-	log.Printf("=== QUIC Connection Summary for %s ===", ql.sessionID)
-	log.Printf("Duration: %.2f seconds", metrics["duration_seconds"])
-	log.Printf("Packets: Sent=%d, Received=%d, Acked=%d, Lost=%d",
-		metrics["total_packets_sent"], metrics["total_packets_received"],
-		metrics["total_packets_acked"], metrics["total_packets_lost"])
-	log.Printf("Loss Rate: %.2f%%", metrics["loss_rate_percent"])
-	log.Printf("Total Bytes: %d", metrics["total_bytes"])
-	log.Printf("RTT: %v", rtt)
-	log.Printf("Events: ACKs=%d, Losses=%d, Congestion=%d, MoQ Objects=%d",
-		metrics["ack_events_count"], metrics["loss_events_count"],
-		metrics["congestion_events_count"], metrics["moq_objects_count"])
-	log.Printf("=======================================")
-}
-
-// LogDetailedStats prints detailed statistics including recent events
-func (ql *QuicLogger) LogDetailedStats() {
-	ql.LogSummary()
-
-	// Show recent loss events
-	lossEvents := ql.GetLossEvents()
-	if len(lossEvents) > 0 {
-		log.Printf("\\n=== Recent Packet Loss Events ===")
-		recentLosses := lossEvents
-		if len(recentLosses) > 5 {
-			recentLosses = recentLosses[len(recentLosses)-5:]
-		}
-		for _, event := range recentLosses {
-			log.Printf("Loss: Packet=%d, Level=%v, Reason=%v, Time=%v",
-				event.PacketNumber, event.EncryptionLevel, event.Reason, event.Timestamp.Format("15:04:05.000"))
+				q.prune(time.Now())
+				q.mtx.Unlock()
+				q.logToTerminal(LogLevelDebug, "rtt=%v cwnd=%d bif=%d pif=%d", q.latestRTT, cwnd, bytesInFlight, packetsInFlight)
+			},
+			Close: func() {},
 		}
 	}
-
-	// Show MoQ object transfer stats
-	moqEvents := ql.GetMOQObjectEvents()
-	if len(moqEvents) > 0 {
-		log.Printf("\\n=== MoQ Object Transfer Stats ===")
-		sentObjects := 0
-		receivedObjects := 0
-		totalSentBytes := 0
-		totalReceivedBytes := 0
-
-		for _, event := range moqEvents {
-			if event.Direction == "sent" {
-				sentObjects++
-				totalSentBytes += event.Size
-			} else {
-				receivedObjects++
-				totalReceivedBytes += event.Size
-			}
-		}
-
-		log.Printf("Objects: Sent=%d, Received=%d", sentObjects, receivedObjects)
-		log.Printf("MoQ Bytes: Sent=%d, Received=%d", totalSentBytes, totalReceivedBytes)
-
-		// Show recent transfers
-		recentMoQ := moqEvents
-		if len(recentMoQ) > 3 {
-			recentMoQ = recentMoQ[len(recentMoQ)-3:]
-		}
-		for _, event := range recentMoQ {
-			log.Printf("MoQ %s: Track=%s, Group=%d, Object=%d, Size=%d bytes",
-				event.Direction, event.TrackName, event.GroupID, event.ObjectID, event.Size)
-		}
-	}
-
-	// Show congestion events
-	congestionEvents := ql.GetCongestionEvents()
-	if len(congestionEvents) > 0 {
-		log.Printf("\\n=== Congestion Control Events ===")
-		recentCongestion := congestionEvents
-		if len(recentCongestion) > 3 {
-			recentCongestion = recentCongestion[len(recentCongestion)-3:]
-		}
-		for _, event := range recentCongestion {
-			log.Printf("Congestion: State=%v, Time=%v",
-				event.State, event.Timestamp.Format("15:04:05.000"))
-		}
-	}
-} // logToTerminal handles terminal output based on log level
-func (ql *QuicLogger) logToTerminal(level LogLevel, format string, args ...interface{}) {
-	if level <= ql.logLevel {
-		prefix := fmt.Sprintf("[%s]", ql.sessionID)
-		log.Printf(prefix+" "+format, args...)
-	}
 }
 
-// Reset clears all stored events and metrics
-func (ql *QuicLogger) Reset() {
-	ql.mutex.Lock()
-	defer ql.mutex.Unlock()
+//
+// ====== Summaries ======
+//
 
-	ql.ackEvents = ql.ackEvents[:0]
-	ql.lossEvents = ql.lossEvents[:0]
-	ql.congestionEvents = ql.congestionEvents[:0]
-	ql.connectionEvents = ql.connectionEvents[:0]
-	ql.moqObjectEvents = ql.moqObjectEvents[:0]
+func (q *QuicLogger) SetLogLevel(level LogLevel) {
+	q.mtx.Lock()
+	q.logLevel = level
+	q.mtx.Unlock()
+}
 
-	ql.totalPacketsSent = 0
-	ql.totalPacketsReceived = 0
-	ql.totalPacketsAcked = 0
-	ql.totalPacketsLost = 0
-	ql.totalBytesTransferred = 0
-	ql.startTime = time.Now()
+func (q *QuicLogger) LogSummary() {
+	m := q.GetRollingMetrics()
+	if q.windowMode == ByPackets {
+		log.Printf("=== QUIC %s Summary (pkts=%d span=%v) ===", q.sessionID, m.PktWindow, m.Window)
+	} else {
+		log.Printf("=== QUIC %s Summary (window=%v) ===", q.sessionID, m.Window)
+	}
+	log.Printf(
+		"RTT=%v Loss=%.2f%% SentPkts=%d Acked=%d Lost=%d SentRate=%.1f kbps RecvRate=%.1f kbps CWND=%d BIF=%d PIF=%d",
+		m.SmoothedRTT, m.LossPercent, m.SentPackets, m.AckedPackets, m.LostPackets,
+		m.SendRateBps/1000, m.RecvRateBps/1000, m.CwndBytes, m.BytesInFlight, m.PacketsInFlight,
+	)
+	log.Printf("====================================")
+}
+
+func (q *QuicLogger) LogDetailedStats() {
+	q.LogSummary()
 }

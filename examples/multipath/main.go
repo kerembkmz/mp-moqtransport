@@ -110,16 +110,19 @@ func runServer(opts *options) error {
 	// Create the multipath subscriber
 	subscriber := NewMultiPathSubscriber([]string{opts.namespace}, opts.trackname)
 
-	// Create loggers for server connections
-	wifiServerLogger := quicmoq.NewQuicLoggerWithDefaults("subscriber-WiFi")
-	wifiServerLogger.SetLogLevel(quicmoq.LogLevelInfo)
-	lteServerLogger := quicmoq.NewQuicLoggerWithDefaults("subscriber-LTE")
-	lteServerLogger.SetLogLevel(quicmoq.LogLevelInfo)
+	// Create a root logger for subscriber that will produce per-connection child loggers
+	subscriberRootLogger := quicmoq.NewRootQuicLogger("subscriber", &quicmoq.LoggerConfig{
+		LogLevel:          quicmoq.LogLevelInfo, // or LogLevelDebug for full telemetry
+		MaxEventsPerType:  1000,
+		EnableTerminalLog: true,
+		WindowMode:        quicmoq.ByPackets, // use packet-based rolling window
+		WindowPackets:     200,               // number of packets in rolling sample
+	})
 
 	// (WiFi simulation listener)
 	listener1, err := quic.ListenAddr(fmt.Sprintf("%s:%d", opts.addr, opts.port1), tlsConfig, &quic.Config{
 		EnableDatagrams: true,
-		Tracer:          wifiServerLogger.CreateConnectionTracer(),
+		Tracer:          subscriberRootLogger.CreateConnectionTracer(),
 	})
 	if err != nil {
 		return fmt.Errorf("failed to start WiFi listener: %v", err)
@@ -129,7 +132,7 @@ func runServer(opts *options) error {
 	// (LTE simulation listener)
 	listener2, err := quic.ListenAddr(fmt.Sprintf("%s:%d", opts.addr, opts.port2), tlsConfig, &quic.Config{
 		EnableDatagrams: true,
-		Tracer:          lteServerLogger.CreateConnectionTracer(),
+		Tracer:          subscriberRootLogger.CreateConnectionTracer(),
 	})
 	if err != nil {
 		return fmt.Errorf("failed to start LTE listener: %v", err)
@@ -189,30 +192,37 @@ func runClient(opts *options) error {
 
 	publisher := NewMultiPathPublisher([]string{opts.namespace}, opts.trackname, currentSelector)
 
+	stop := make(chan struct{})
+	publisher.StartTelemetrySampler(1*time.Second, stop)
 	// connection 1
-	wifiLogger := quicmoq.NewQuicLoggerWithDefaults("publisher-WiFi")
-	wifiLogger.SetLogLevel(quicmoq.LogLevelInfo)
-	conn1, err := dialQUICWithLogger(context.Background(), fmt.Sprintf("%s:%d", opts.addr, opts.port1), wifiLogger)
+	// Create a root logger for publisher that will create per-connection child loggers
+	publisherRootLogger := quicmoq.NewRootQuicLogger("publisher", &quicmoq.LoggerConfig{
+		LogLevel:          quicmoq.LogLevelInfo, // or LogLevelDebug for full telemetry
+		MaxEventsPerType:  1000,
+		EnableTerminalLog: true,
+		WindowMode:        quicmoq.ByPackets, // use packet-based rolling window
+		WindowPackets:     200,               // number of packets in rolling sample
+	})
+	conn1, logger1, err := dialQUICWithLogger(context.Background(), fmt.Sprintf("%s:%d", opts.addr, opts.port1), publisherRootLogger)
 	if err != nil {
 		return fmt.Errorf("failed to connect via WiFi: %v", err)
 	}
 	log.Printf("Connected via WiFi path")
 
 	// connection 2
-	lteLogger := quicmoq.NewQuicLoggerWithDefaults("publisher-LTE")
-	lteLogger.SetLogLevel(quicmoq.LogLevelInfo)
-	conn2, err := dialQUICWithLogger(context.Background(), fmt.Sprintf("%s:%d", opts.addr, opts.port2), lteLogger)
+	conn2, logger2, err := dialQUICWithLogger(context.Background(), fmt.Sprintf("%s:%d", opts.addr, opts.port2), publisherRootLogger)
 	if err != nil {
 		return fmt.Errorf("failed to connect via LTE: %v", err)
 	}
 	log.Printf("Connected via LTE path")
 
-	// Add connections to the publisher with their loggers
-	if err := publisher.AddConnectionWithLogger(conn1, "WiFi", wifiLogger); err != nil {
+	// Add connections to the publisher.
+	// Publisher will be able to access child loggers by the underlying connection ID
+	if err := publisher.AddConnectionWithLogger(conn1, "WiFi", logger1); err != nil {
 		return fmt.Errorf("failed to add WiFi connection: %v", err)
 	}
 
-	if err := publisher.AddConnectionWithLogger(conn2, "LTE", lteLogger); err != nil {
+	if err := publisher.AddConnectionWithLogger(conn2, "LTE", logger2); err != nil {
 		return fmt.Errorf("failed to add LTE connection: %v", err)
 	}
 
@@ -225,7 +235,7 @@ func runClient(opts *options) error {
 	}
 
 	go func() {
-		ticker := time.NewTicker(10 * time.Second)
+		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
 			publisher.PrintDetailedStats()
@@ -238,7 +248,7 @@ func runClient(opts *options) error {
 }
 
 func publishVideoFrames(publisher *MultiPathPublisher) {
-	ticker := time.NewTicker(1 * time.Second) // 1 FPS for easier logging
+	ticker := time.NewTicker(time.Second / 24) // 24 FPS
 	defer ticker.Stop()
 
 	groupID := uint64(0)
@@ -294,16 +304,35 @@ func generateTLSConfig() (*tls.Config, error) {
 	}, nil
 }
 
-func dialQUICWithLogger(ctx context.Context, addr string, logger *quicmoq.QuicLogger) (moqtransport.Connection, error) {
+func dialQUICWithLogger(ctx context.Context, addr string, rootLogger *quicmoq.RootQuicLogger) (moqtransport.Connection, *quicmoq.QuicLogger, error) {
 	conn, err := quic.DialAddr(ctx, addr, &tls.Config{
 		InsecureSkipVerify: true,
 		NextProtos:         []string{"moq-00"},
 	}, &quic.Config{
 		EnableDatagrams: true,
-		Tracer:          logger.CreateConnectionTracer(),
+		Tracer:          rootLogger.CreateConnectionTracer(),
 	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return quicmoq.NewClient(conn), nil
+
+	client := quicmoq.NewClient(conn)
+
+	// Attempt to obtain the child logger that the tracer wrapper should have registered in StartedConnection.
+	// Sometimes quic-go emits StartedConnection slightly after Dial returns, so wait briefly (poll) for it.
+	var child *quicmoq.QuicLogger
+	if conn.RemoteAddr() != nil {
+		addrKey := conn.RemoteAddr().String()
+		// poll for up to 250ms
+		deadline := time.Now().Add(250 * time.Millisecond)
+		for time.Now().Before(deadline) {
+			child = rootLogger.GetRegisteredChild(addrKey)
+			if child != nil {
+				break
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+
+	return client, child, nil
 }
